@@ -1,0 +1,177 @@
+/* Parcel Handoff Verifier - Arduino IDE board: ESP32 Dev Module */
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
+const char* TS_API_KEY = "";
+
+const int ENTRY = 25, TRAY_A = 26, TRAY_B = 27;  // Active-low IR outputs
+const int CLK = 32, DT = 33;                    // Rotary encoder
+const int GREEN = 18, RED = 19;
+const int irPins[] = {ENTRY, TRAY_A, TRAY_B};
+extern const char ROOT_CA[];  // ThingSpeak's certificate authority is below loop()
+
+enum { NONE, A, B };
+enum { READY, CORRECT, WRONG, UNCONFIRMED };
+int selected = A, expected = NONE;
+int result = READY, lastExpected = NONE, lastObserved = NONE;
+unsigned long count[4] = {}, enteredAt = 0, handoffMs = 0, lastUpload = 0;
+int rawIR[3], stableIR[3], previousCLK;
+unsigned long changedAt[3] = {};
+bool uploadPending = true;
+
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < 3; i++) {
+    pinMode(irPins[i], INPUT_PULLUP);
+    rawIR[i] = stableIR[i] = digitalRead(irPins[i]);
+  }
+  pinMode(CLK, INPUT_PULLUP);
+  pinMode(DT, INPUT_PULLUP);
+  previousCLK = digitalRead(CLK);
+  pinMode(GREEN, OUTPUT);
+  pinMode(RED, OUTPUT);
+  digitalWrite(GREEN, LOW);
+  digitalWrite(RED, LOW);
+
+  if (WIFI_SSID[0] && TS_API_KEY[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  Serial.println("Ready. Route A selected.");
+}
+
+// Read a fresh detection after the IR signal has been stable for 20 ms.
+bool detected(int i, unsigned long now) {
+  int reading = digitalRead(irPins[i]);
+  if (reading != rawIR[i]) {
+    rawIR[i] = reading;
+    changedAt[i] = now;
+  }
+  if (reading == stableIR[i] || now - changedAt[i] < 20) return false;
+  stableIR[i] = reading;
+  return reading == LOW;
+}
+
+void readEncoder() {
+  int clk = digitalRead(CLK);
+  if (previousCLK == HIGH && clk == LOW) {
+    int route = digitalRead(DT) == HIGH ? B : A;
+    if (route != selected) {
+      selected = route;
+      Serial.println(selected == A ? "Next parcel: Tray A" : "Next parcel: Tray B");
+    }
+  }
+  previousCLK = clk;
+}
+
+void checkParcel(unsigned long now) {
+  bool entry = detected(0, now);
+  bool trayA = detected(1, now);
+  bool trayB = detected(2, now);
+
+  if (expected == NONE) {
+    if (entry) {
+      expected = selected;
+      enteredAt = now;
+      digitalWrite(GREEN, LOW);
+      digitalWrite(RED, LOW);
+      Serial.println(expected == A ? "In transit to A" : "In transit to B");
+    }
+    return;
+  }
+
+  handoffMs = now - enteredAt;
+  bool timedOut = handoffMs >= 10000 || (trayA && trayB);
+  if (!timedOut && !trayA && !trayB) return;
+
+  lastExpected = expected;
+  lastObserved = timedOut ? NONE : (trayA ? A : B);
+  result = timedOut ? UNCONFIRMED : (lastObserved == expected ? CORRECT : WRONG);
+  count[result]++;
+  expected = NONE;
+  digitalWrite(GREEN, result == CORRECT);
+  digitalWrite(RED, result != CORRECT);
+
+  const char* messages[] = {"Ready", "Correct route", "Wrong tray", "Unconfirmed"};
+  Serial.println(messages[result]);
+  uploadPending = true;
+}
+
+void uploadToThingSpeak(unsigned long now) {
+  if (!uploadPending || expected != NONE || WiFi.status() != WL_CONNECTED) return;
+
+  static bool clockStarted = false;
+  if (!clockStarted) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    clockStarted = true;
+    Serial.println("Wi-Fi connected. Preparing ThingSpeak.");
+  }
+  if (time(nullptr) < 1700000000 || now - lastUpload < 20000) return;
+  lastUpload = now;
+
+  WiFiClientSecure client;
+  client.setCACert(ROOT_CA);
+  client.setHandshakeTimeout(3);
+
+  HTTPClient http;
+  http.setConnectTimeout(2500);
+  http.setTimeout(2500);
+  if (!http.begin(client, "https://api.thingspeak.com/update")) return;
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("THINGSPEAKAPIKEY", TS_API_KEY);
+  String data = "field1=" + String(count[CORRECT]) + "&field2=" + String(count[WRONG])
+              + "&field3=" + String(count[UNCONFIRMED]) + "&field4=" + String(result)
+              + "&field5=" + String(lastExpected) + "&field6=" + String(lastObserved)
+              + "&field7=" + String(handoffMs);
+
+  int status = http.POST(data);
+  long entry = status == 200 ? http.getString().toInt() : 0;
+  http.end();
+
+  if (entry > 0) {
+    uploadPending = false;
+    Serial.printf("ThingSpeak saved entry %ld\n", entry);
+  } else {
+    Serial.printf("ThingSpeak upload pending (HTTP %d)\n", status);
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+  readEncoder();
+  checkParcel(now);
+  uploadToThingSpeak(now);
+  delay(2);
+}
+
+// DigiCert Global Root G2
+const char ROOT_CA[] = R"PEM(
+-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUYBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+)PEM";
